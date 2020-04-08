@@ -9,7 +9,21 @@ Licensed under the terms of MIT license (see LICENSE file)
 import json
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-from qgis.core import QgsSymbol, QgsWkbTypes, QgsVectorTileBasicRenderer, QgsVectorTileBasicRendererStyle, QgsProperty, QgsSymbolLayer
+from qgis.core import (
+    QgsPalLayerSettings,
+    QgsProperty,
+    QgsPropertyCollection,
+    QgsSymbol,
+    QgsSymbolLayer,
+    QgsTextBufferSettings,
+    QgsTextFormat,
+    QgsUnitTypes,
+    QgsVectorTileBasicLabeling,
+    QgsVectorTileBasicLabelingStyle,
+    QgsVectorTileBasicRenderer,
+    QgsVectorTileBasicRendererStyle,
+    QgsWkbTypes,
+)
 
 
 PX_TO_MM = 0.26  # TODO: some good conversion ratio
@@ -166,14 +180,14 @@ def parse_fill_layer(json_layer):
     return st
 
 
-def parse_interpolate_by_zoom(json_obj):
+def parse_interpolate_by_zoom(json_obj, multiplier=1):
     base = json_obj['base'] if 'base' in json_obj else 1
     stops = json_obj['stops']  # TODO: use intermediate stops
     if base == 1:
         scale_expr = "scale_linear(@zoom_level, {}, {}, {}, {})".format(stops[0][0], stops[-1][0], stops[0][1], stops[-1][1])
     else:
         scale_expr = "scale_exp(@zoom_level, {}, {}, {}, {}, {})".format(stops[0][0], stops[-1][0], stops[0][1], stops[-1][1], base)
-    return scale_expr + " * {}".format(PX_TO_MM)
+    return scale_expr + " * {}".format(multiplier)
 
 
 def parse_line_layer(json_layer):
@@ -198,7 +212,7 @@ def parse_line_layer(json_layer):
         if isinstance(json_line_width, (float, int)):
             line_width = float(json_line_width)
         elif isinstance(json_line_width, dict):
-            dd_properties[QgsSymbolLayer.PropertyWidth] = parse_interpolate_by_zoom(json_line_width)
+            dd_properties[QgsSymbolLayer.PropertyWidth] = parse_interpolate_by_zoom(json_line_width, PX_TO_MM)
         else:
             print("skipping non-float line-width", json_line_width)
 
@@ -244,13 +258,87 @@ def parse_line_layer(json_layer):
 
 
 def parse_symbol_layer(json_layer):
-    return None  # TODO
+
+    json_layout = json_layer['layout']
+    json_paint = json_layer['paint']
+
+    dd_properties = {}
+
+    TEXT_SIZE_MULTIPLIER = 2  # *2 because of high-res screen?
+
+    text_size = 16
+    if 'text-size' in json_layout:
+        json_text_size = json_layout['text-size']
+        if isinstance(json_text_size, (float, int)):
+            text_size = json_text_size
+        elif isinstance(json_text_size, dict):
+            dd_properties[QgsPalLayerSettings.Size] = parse_interpolate_by_zoom(json_text_size, TEXT_SIZE_MULTIPLIER)
+        else:
+            print("skipping non-float text-size", json_text_size)
+
+    # TODO: text-font
+
+    text_color = Qt.black
+    if 'text-color' in json_paint:
+        json_text_color = json_paint['text-color']
+        if isinstance(json_text_color, str):
+            text_color = parse_color(json_text_color)
+        else:
+            print("skipping non-string text-color", json_text_color)
+
+    buffer_color = QColor(0, 0, 0, 0)
+    if 'text-halo-color' in json_paint:
+        json_text_halo_color = json_paint['text-halo-color']
+        if isinstance(json_text_halo_color, str):
+            buffer_color = parse_color(json_text_halo_color)
+        else:
+            print("skipping non-string text-halo-color", json_text_halo_color)
+
+    buffer_size = 0
+    if 'text-halo-width' in json_paint:
+        json_text_halo_width = json_paint['text-halo-width']
+        if isinstance(json_text_halo_width, (float, int)):
+            buffer_size = json_text_halo_width
+        else:
+            print("skipping non-float text-halo-width", json_text_halo_width)
+
+    format = QgsTextFormat()
+    format.setColor(text_color)
+    format.setSize(text_size * TEXT_SIZE_MULTIPLIER)
+    format.setSizeUnit(QgsUnitTypes.RenderPixels)
+    #format.setFont(font)
+
+    if buffer_size > 0:
+        buffer_settings = QgsTextBufferSettings()
+        buffer_settings.setEnabled(True)
+        buffer_settings.setSize(buffer_size * PX_TO_MM * TEXT_SIZE_MULTIPLIER)
+        buffer_settings.setColor(buffer_color)
+        format.setBuffer(buffer_settings)
+
+    label_settings = QgsPalLayerSettings()
+    label_settings.fieldName = '"name:latin"'  # TODO: parse field name
+    label_settings.isExpression = True
+    label_settings.placement = QgsPalLayerSettings.OverPoint
+    label_settings.priority = min(text_size/3., 10.)
+    label_settings.setFormat(format)
+
+    if dd_properties:
+        for dd_key, dd_expression in dd_properties.items():
+            prop_collection = QgsPropertyCollection()
+            prop_collection.setProperty(dd_key, QgsProperty.fromExpression(dd_expression))
+        label_settings.setDataDefinedProperties(prop_collection)
+
+    lb = QgsVectorTileBasicLabelingStyle()
+    lb.setGeometryType(QgsWkbTypes.PointGeometry)
+    lb.setLabelSettings(label_settings)
+    return lb
 
 
 def parse_layers(json_layers):
-    """ Parse list of layers from JSON and return QgsVectorTileBasicRenderer """
+    """ Parse list of layers from JSON and return QgsVectorTileBasicRenderer + QgsVectorTileBasicLabeling in a tuple """
 
-    styles = []
+    renderer_styles = []
+    labeling_styles = []
 
     for json_layer in json_layers:
         layer_type = json_layer['type']
@@ -266,14 +354,15 @@ def parse_layers(json_layers):
 
         filter_expr = ''
         if 'filter' in json_layer:
-          filter_expr = parse_expression(json_layer['filter'])
+            filter_expr = parse_expression(json_layer['filter'])
 
+        st, lb = None, None
         if layer_type == 'fill':
             st = parse_fill_layer(json_layer)
         elif layer_type == 'line':
             st = parse_line_layer(json_layer)
         elif layer_type == 'symbol':
-            st = parse_symbol_layer(json_layer)
+            lb = parse_symbol_layer(json_layer)
         else:
             print("skipping unknown layer type", layer_type)
             continue
@@ -285,12 +374,24 @@ def parse_layers(json_layers):
             st.setMinZoomLevel(min_zoom)
             st.setMaxZoomLevel(max_zoom)
             st.setEnabled(enabled)
-            styles.append(st)
+            renderer_styles.append(st)
+
+        if lb:
+            lb.setStyleName(style_id)
+            lb.setLayerName(layer_name)
+            lb.setFilterExpression(filter_expr)
+            lb.setMinZoomLevel(min_zoom)
+            lb.setMaxZoomLevel(max_zoom)
+            lb.setEnabled(enabled)
+            labeling_styles.append(lb)
 
     renderer = QgsVectorTileBasicRenderer()
-    renderer.setStyles(styles)
-    return renderer
+    renderer.setStyles(renderer_styles)
 
+    labeling = QgsVectorTileBasicLabeling()
+    labeling.setStyles(labeling_styles)
+
+    return renderer, labeling
 
 
 def parse_json(filename='/home/martin/tmp/mvt-plugin-layer/style.json'):

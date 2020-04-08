@@ -13,5 +13,7 @@ exec(open('/path/to/mapbox2qgis/mapbox2qgis.py'.encode('utf-8')).read())
 Then you can select a vector tile layer and run the conversion:
 
 ```
-iface.activeLayer().setRenderer(parse_json('/path/to/my/style.json'))
+renderer, labeling = parse_json('/path/to/my/style.json')
+iface.activeLayer().setRenderer(renderer)
+iface.activeLayer().setLabeling(labeling)
 ```
