@@ -7,8 +7,12 @@ Licensed under the terms of MIT license (see LICENSE file)
 """
 
 import json
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-from qgis.core import QgsSymbol, QgsWkbTypes, QgsVectorTileBasicRenderer, QgsVectorTileBasicRendererStyle
+from qgis.core import QgsSymbol, QgsWkbTypes, QgsVectorTileBasicRenderer, QgsVectorTileBasicRendererStyle, QgsProperty, QgsSymbolLayer
+
+
+PX_TO_MM = 0.26  # TODO: some good conversion ratio
 
 
 def parse_color(json_color):
@@ -51,6 +55,24 @@ def parse_color(json_color):
         return QColor(int(lst[0]), int(lst[1]), int(lst[2]))
     else:
         raise ValueError("unknown color syntax", json_color)
+
+
+def parse_line_cap(json_line_cap):
+    """ Return value from Qt.PenCapStyle enum from JSON value """
+    if json_line_cap == "round":
+      return Qt.RoundCap
+    if json_line_cap == "square":
+      return Qt.SquareCap
+    return Qt.FlatCap   # "butt" is default
+
+
+def parse_line_join(json_line_join):
+    """ Return value from Qt.PenJoinStyle enum from JSON value """
+    if json_line_join == "bevel":
+      return Qt.BevelJoin
+    if json_line_join == "round":
+      return Qt.RoundJoin
+    return Qt.MiterJoin  # "miter" is default
 
 
 def parse_key(json_key):
@@ -130,6 +152,8 @@ def parse_fill_layer(json_layer):
         else:
             print("skipping non-float opacity", json_fill_opacity)
 
+    # TODO: fill-translate
+
     sym = QgsSymbol.defaultSymbol(QgsWkbTypes.PolygonGeometry)
     fill_symbol = sym.symbolLayer(0)
     fill_symbol.setColor(fill_color)
@@ -142,12 +166,24 @@ def parse_fill_layer(json_layer):
     return st
 
 
+def parse_interpolate_by_zoom(json_obj):
+    base = json_obj['base'] if 'base' in json_obj else 1
+    stops = json_obj['stops']  # TODO: use intermediate stops
+    if base == 1:
+        scale_expr = "scale_linear(@zoom_level, {}, {}, {}, {})".format(stops[0][0], stops[-1][0], stops[0][1], stops[-1][1])
+    else:
+        scale_expr = "scale_exp(@zoom_level, {}, {}, {}, {}, {})".format(stops[0][0], stops[-1][0], stops[0][1], stops[-1][1], base)
+    return scale_expr + " * {}".format(PX_TO_MM)
+
+
 def parse_line_layer(json_layer):
     json_paint = json_layer['paint']
 
     if 'line-color' not in json_paint:
         print("skipping line without line-color", json_paint)
         return
+
+    dd_properties = {}
 
     json_line_color = json_paint['line-color']
     if not isinstance(json_line_color, str):
@@ -156,14 +192,59 @@ def parse_line_layer(json_layer):
 
     line_color = parse_color(json_line_color)
 
+    line_width = 0
+    if 'line-width' in json_paint:
+        json_line_width = json_paint['line-width']
+        if isinstance(json_line_width, (float, int)):
+            line_width = float(json_line_width)
+        elif isinstance(json_line_width, dict):
+            dd_properties[QgsSymbolLayer.PropertyWidth] = parse_interpolate_by_zoom(json_line_width)
+        else:
+            print("skipping non-float line-width", json_line_width)
+
+    line_opacity = 1
+    if 'line-opacity' in json_paint:
+        json_line_opacity = json_paint['line-opacity']
+        if isinstance(json_line_opacity, (float, int)):
+            line_opacity = float(json_line_opacity)
+        else:
+            print("skipping non-float line-opacity", json_line_opacity)
+
+    dash_vector = None
+    if 'line-dasharray' in json_paint:
+        json_dasharray = json_paint['line-dasharray']
+        dash_vector = list(map(float, json_dasharray))
+
+    pen_cap_style = Qt.FlatCap
+    pen_join_style = Qt.MiterJoin
+    if 'layout' in json_layer:
+        json_layout = json_layer['layout']
+        if 'line-cap' in json_layout:
+            pen_cap_style = parse_line_cap(json_layout['line-cap'])
+        if 'line-join' in json_layout:
+            pen_join_style = parse_line_join(json_layout['line-join'])
+
     sym = QgsSymbol.defaultSymbol(QgsWkbTypes.LineGeometry)
     line_symbol = sym.symbolLayer(0)
     line_symbol.setColor(line_color)
+    line_symbol.setWidth(line_width * PX_TO_MM)
+    line_symbol.setPenCapStyle(pen_cap_style)
+    line_symbol.setPenJoinStyle(pen_join_style)
+    if dash_vector is not None:
+        line_symbol.setCustomDashVector(dash_vector)
+        line_symbol.setUseCustomDashPattern(True)
+    for dd_key, dd_expression in dd_properties.items():
+        line_symbol.setDataDefinedProperty(dd_key, QgsProperty.fromExpression(dd_expression))
+    sym.setOpacity(line_opacity)
 
     st = QgsVectorTileBasicRendererStyle()
     st.setGeometryType(QgsWkbTypes.LineGeometry)
     st.setSymbol(sym)
     return st
+
+
+def parse_symbol_layer(json_layer):
+    return None  # TODO
 
 
 def parse_layers(json_layers):
@@ -179,6 +260,10 @@ def parse_layers(json_layers):
         min_zoom = json_layer['minzoom'] if 'minzoom' in json_layer else -1
         max_zoom = json_layer['maxzoom'] if 'maxzoom' in json_layer else -1
 
+        enabled = True
+        if 'visibility' in json_layer and json_layer['visibility'] == 'none':
+            enabled = False
+
         filter_expr = ''
         if 'filter' in json_layer:
           filter_expr = parse_expression(json_layer['filter'])
@@ -187,6 +272,8 @@ def parse_layers(json_layers):
             st = parse_fill_layer(json_layer)
         elif layer_type == 'line':
             st = parse_line_layer(json_layer)
+        elif layer_type == 'symbol':
+            st = parse_symbol_layer(json_layer)
         else:
             print("skipping unknown layer type", layer_type)
             continue
@@ -197,9 +284,8 @@ def parse_layers(json_layers):
             st.setFilterExpression(filter_expr)
             st.setMinZoomLevel(min_zoom)
             st.setMaxZoomLevel(max_zoom)
+            st.setEnabled(enabled)
             styles.append(st)
-
-        #print(style_id, layer_type, layer_name, min_zoom, max_zoom, filter_expr)
 
     renderer = QgsVectorTileBasicRenderer()
     renderer.setStyles(styles)
