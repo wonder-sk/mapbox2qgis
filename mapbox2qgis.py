@@ -117,8 +117,13 @@ def parse_expression(json_expr):
         lst = [parse_value(v) for v in json_expr[1:]]
         return "({})".format(") OR (".join(lst))
     elif op in ("==", "!=", ">=", ">", "<=", "<"):
+
+        # use IS and NOT IS instead of = and != because they can deal with NULL values
         if op == "==":
-            op = "="   # we use single '=' not '=='
+            op = "IS"
+        elif op == "!=":
+            op = "NOT IS"
+
         return "{} {} {}".format(parse_key(json_expr[1]), op, parse_value(json_expr[2]))
     elif op == 'has':
         return parse_key(json_expr[1]) + " IS NOT NULL"
@@ -212,7 +217,7 @@ def parse_line_layer(json_layer):
         if isinstance(json_line_width, (float, int)):
             line_width = float(json_line_width)
         elif isinstance(json_line_width, dict):
-            dd_properties[QgsSymbolLayer.PropertyWidth] = parse_interpolate_by_zoom(json_line_width, PX_TO_MM)
+            dd_properties[QgsSymbolLayer.PropertyStrokeWidth] = parse_interpolate_by_zoom(json_line_width, PX_TO_MM)
         else:
             print("skipping non-float line-width", json_line_width)
 
